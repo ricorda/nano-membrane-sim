@@ -46,6 +46,7 @@
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -76,6 +77,8 @@ def get_args():
     p.add_argument("--kt", type=float, default=1.0,
                    help="温度（约化单位，默认 1）。调小它：静态形变应该不变，噪声按 √kT 变小")
     p.add_argument("--noplot", action="store_true", help="只算不画图")
+    p.add_argument("--dump-config", dest="dump_config", action="store_true",
+                   help="把几何与力学的关键常数打印成 JSON 后退出（给别的脚本读数用）")
     return p.parse_args()
 
 
@@ -104,6 +107,7 @@ STEP_MAX = 0.20     # 单步最大位移，防止爆炸（要比 σ=√(2·dt·k
 P_MOB = 0.6         # 颗粒的迁移率因子（颗粒比珠子大，动得慢）
 REC = 20            # 每隔多少步记录一次
 FAR_NM = 5.0        # 离颗粒多远算"远处膜面"（吸引截断 R+CUT ≈ 4.3 nm，留余量）
+Z_CEIL = D0 / 2 + R + 8.0   # 颗粒中心的上限，对应 gap = +8 nm（撞到它就是脱附）
 
 # ---- 配体链（只做几何：占地方，不和膜发生吸引）----
 L_LIG = 4           # 每条链几颗珠子
@@ -124,6 +128,17 @@ if N_LIG > MAX_LIG:
           f"（周长 {2*np.pi*R:.1f} nm ÷ 链距 {D_LL:.1f} nm），已按 {MAX_LIG} 处理。"
           f"真实三维里同一面积能放更多，这是二维模型的局限。")
     N_LIG = MAX_LIG
+
+if ARGS.dump_config:
+    # 别的脚本要跟这里保持同一个"事实来源"，别各自硬编码一份
+    print(json.dumps({
+        "R": R, "D_LL": D_LL, "D_LM": D_LM, "D0": D0, "A": A, "N_COL": N_COL,
+        "K_S": K_S, "K_B": K_B, "K_T": K_T, "KT": KT, "STEP_MAX": STEP_MAX,
+        "W": W, "CUT": CUT, "SWITCH": SWITCH, "L_LIG": L_LIG, "L_BOND": L_BOND,
+        "MAX_LIG": MAX_LIG, "FAR_NM": FAR_NM, "Z_CEIL": Z_CEIL,
+        "twoleaf": bool(ARGS.twoleaf),
+    }, ensure_ascii=False))
+    raise SystemExit(0)
 
 L = N_COL * A       # 膜的总长度 nm
 # 颗粒的 x 位置：放在晶格的正中，即两根珠子之间。
@@ -388,6 +403,7 @@ def run():
 
     hist_t, hist_gap, hist_nc = [], [], []
     n_clip = 0                     # 颗粒单步位移被截断的次数（截断会压低有效温度）
+    n_ceil = 0                     # 颗粒撞到顶盖的次数（>0 说明脱附了）
     prof_u = np.zeros(N_COL)       # 后半段的时间平均形状，压掉热噪声
     prof_n = 0
     # 收敛性检查：把后半段切成 NBLK 块，各自平均，看它们是否重合
@@ -430,6 +446,12 @@ def run():
         dp = np.clip(dp, -STEP_MAX, STEP_MAX)
         pz += dp
 
+        # 顶盖：颗粒不能飘出盒子。没有它，弱吸引时颗粒会一路扩散到 +200 nm，
+        # 扫参时那些点就变成没有意义的大数。撞到顶盖 = 脱附，记录为 +Z_CEIL。
+        if pz > Z_CEIL:
+            pz = Z_CEIL
+            n_ceil += 1
+
         # ---- 记录 ----
         if step % REC == 0:
             t = step * DT
@@ -458,11 +480,12 @@ def run():
             np.array(hist_nc),
             prof, z_u.copy(), pz, blocks, np.array(far_samp),
             n_clip / max(STEPS, 1),
+            n_ceil / max(STEPS, 1),
             lig.copy(), lig_contact_acc / max(lig_contact_n, 1))
 
 
 t_arr, gap_arr, nc_arr, z_u_mean, z_u_fin, pz_fin, blk_mean, far_samp, clip_frac, \
-    lig_fin, lig_contact_mean = run()
+    ceil_frac, lig_fin, lig_contact_mean = run()
 
 # 时间平均形状：先扣掉远处膜面的整体倾斜，再相对远处高度归零
 far_mask = np.abs(x_grid - px) > FAR_NM
@@ -520,7 +543,9 @@ if N_LIG:
 else:
     lig_end_to_end = 0.0
 
-if final_gap < -2.0:
+if final_gap > 3.0:
+    verdict = "颗粒脱附，飘到顶盖去了（没有吸附住）"
+elif final_gap < -2.0:
     verdict = "颗粒钻进了膜内部"
 elif dimple > 0.15:
     verdict = "颗粒被吸住，在膜上压出一个浅坑"
@@ -544,6 +569,7 @@ lines = [
     f"单珠热涨落 实测/理论    {sig_meas:.2f} / {sig_theory:.2f} nm",
     f"分块收敛性 最大偏差      {blk_dev:.3f} nm",
     f"颗粒步长被截断的比例    {clip_frac * 100:.2f} %（>1% 说明 STEP_MAX 太小，会压低有效温度）",
+    f"颗粒撞到顶盖的比例      {ceil_frac * 100:.3f} %（>0 说明它脱附、飘走了）",
     f"下叶是否被吸引          {'是（--twoleaf，旧做法）' if ARGS.twoleaf else '否（默认：只近侧叶受力）'}",
     f"配体链                  {N_LIG} 条 × {L_LIG} 珠" if N_LIG else "配体链                  无（光板球）",
     f"贴膜配体珠数(距<0.9nm)  {lig_contact_mean:.1f} 个" if N_LIG else "",

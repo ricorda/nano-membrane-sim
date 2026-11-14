@@ -1,0 +1,4 @@
+# 只有两个依赖，都是 pip 一行能装上的
+# 没有 scipy、没有 matplotlib、没有 sklearn——高斯过程和画图都是手写的
+numpy>=1.24
+pillow>=9.0
